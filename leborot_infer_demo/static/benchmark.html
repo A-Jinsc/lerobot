@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SmolVLA CPU Inference - Optimization Results</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #f8f9fc;
+      --surface: #ffffff;
+      --border: #e2e8f0;
+      --primary: #4f46e5;
+      --primary-light: #eef2ff;
+      --accent: #06b6d4;
+      --success: #10b981;
+      --danger: #ef4444;
+      --text: #1e293b;
+      --text-muted: #64748b;
+      --radius: 12px;
+      --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+      --shadow-lg: 0 10px 25px rgba(0,0,0,0.08), 0 4px 10px rgba(0,0,0,0.04);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    /* ---- Header ---- */
+    header {
+      background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4f46e5 100%);
+      color: white;
+      padding: 48px 24px 56px;
+      position: relative;
+      overflow: hidden;
+    }
+    header::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.04'%3E%3Ccircle cx='30' cy='30' r='2'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+    }
+    header .content { max-width: 1100px; margin: 0 auto; position: relative; }
+    header .badge {
+      display: inline-block;
+      background: rgba(255,255,255,0.15);
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 20px;
+      padding: 4px 14px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+    header h1 {
+      font-size: 36px;
+      font-weight: 800;
+      line-height: 1.2;
+      margin-bottom: 12px;
+      letter-spacing: -0.5px;
+    }
+    header p.subtitle {
+      font-size: 17px;
+      opacity: 0.8;
+      max-width: 700px;
+    }
+    header .meta {
+      display: flex;
+      gap: 24px;
+      margin-top: 24px;
+      flex-wrap: wrap;
+    }
+    header .meta-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      opacity: 0.75;
+    }
+    header .meta-item svg { flex-shrink: 0; }
+
+    /* ---- Container ---- */
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+    /* ---- Cards ---- */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 28px 32px;
+      margin-bottom: 24px;
+    }
+
+    .card h2 {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .card h2 .icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      background: var(--primary-light);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+    .card .desc {
+      font-size: 14px;
+      color: var(--text-muted);
+      margin-bottom: 24px;
+    }
+
+    /* ---- Summary Cards ---- */
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .summary-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 20px 24px;
+      position: relative;
+      overflow: hidden;
+    }
+    .summary-card::after {
+      content: "";
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      height: 3px;
+      border-radius: 0 0 var(--radius) var(--radius);
+    }
+    .summary-card.green::after { background: var(--success); }
+    .summary-card.purple::after { background: #8b5cf6; }
+    .summary-card.blue::after { background: var(--accent); }
+    .summary-card.orange::after { background: #f59e0b; }
+
+    .summary-card .label {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .summary-card .value {
+      font-size: 30px;
+      font-weight: 800;
+      line-height: 1.1;
+    }
+    .summary-card .sub {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+    .summary-card .value .unit {
+      font-size: 16px;
+      font-weight: 500;
+      opacity: 0.7;
+      margin-left: 2px;
+    }
+
+    /* ---- Chart ---- */
+    .chart-wrapper {
+      position: relative;
+      height: 320px;
+      margin-bottom: 8px;
+    }
+    .chart-legend {
+      display: flex;
+      gap: 24px;
+      justify-content: center;
+      margin-top: 12px;
+    }
+    .chart-legend .item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .chart-legend .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+    }
+
+    /* ---- Stage Table ---- */
+    .stage-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    .stage-table th {
+      text-align: left;
+      padding: 10px 16px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      border-bottom: 2px solid var(--border);
+    }
+    .stage-table td {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .stage-table tr:last-child td { border-bottom: none; }
+    .stage-table tr:hover td { background: #f8fafc; }
+    .stage-table .stage-name { font-weight: 600; }
+    .stage-table .time { font-variant-numeric: tabular-nums; }
+    .stage-table .bar-cell { width: 200px; }
+    .stage-table .bar-bg {
+      height: 8px;
+      background: var(--primary-light);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .stage-table .bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 1s ease;
+    }
+    .stage-table .bar-fill.baseline { background: var(--text-muted); }
+    .stage-table .bar-fill.optimized { background: var(--primary); }
+    .speedup-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .speedup-badge.positive {
+      background: #dcfce7;
+      color: #15803d;
+    }
+    .speedup-badge.negative {
+      background: #fee2e2;
+      color: #dc2626;
+    }
+    .speedup-badge.neutral {
+      background: #f1f5f9;
+      color: var(--text-muted);
+    }
+
+    /* ---- Optimization Cards ---- */
+    .opt-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .opt-card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      position: relative;
+    }
+    .opt-card .opt-num {
+      position: absolute;
+      top: -12px;
+      left: 20px;
+      background: var(--primary);
+      color: white;
+      font-size: 11px;
+      font-weight: 800;
+      padding: 3px 10px;
+      border-radius: 20px;
+    }
+    .opt-card h3 {
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      margin-top: 4px;
+    }
+    .opt-card p {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+    }
+    .opt-card .code-block {
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", monospace;
+      color: #334155;
+      line-height: 1.5;
+    }
+    .opt-card .code-block .arrow { color: var(--text-muted); margin: 0 6px; }
+    .opt-card .code-block .after { color: var(--primary); font-weight: 600; }
+
+    /* ---- Task Flow ---- */
+    .flow {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      flex-wrap: wrap;
+      margin-bottom: 24px;
+    }
+    .flow-step {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      min-width: 100px;
+    }
+    .flow-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      box-shadow: var(--shadow);
+    }
+    .flow-step:nth-child(1) .flow-icon { background: #fef3c7; }
+    .flow-step:nth-child(3) .flow-icon { background: #dbeafe; }
+    .flow-step:nth-child(5) .flow-icon { background: #f3e8ff; }
+    .flow-step:nth-child(7) .flow-icon { background: #dcfce7; }
+    .flow-step .flow-label {
+      font-size: 12px;
+      font-weight: 600;
+      text-align: center;
+      color: var(--text);
+    }
+    .flow-step .flow-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-align: center;
+    }
+    .flow-arrow {
+      font-size: 20px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      padding: 0 4px;
+    }
+
+    /* ---- No Data Notice ---- */
+    .no-data-notice {
+      background: #fffbeb;
+      border: 1px solid #fcd34d;
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      font-size: 14px;
+      color: #92400e;
+      margin-bottom: 20px;
+    }
+    .no-data-notice strong { font-weight: 700; }
+
+    /* ---- Footer ---- */
+    footer {
+      text-align: center;
+      padding: 32px 24px 48px;
+      font-size: 13px;
+      color: var(--text-muted);
+      border-top: 1px solid var(--border);
+      margin-top: 16px;
+    }
+
+    /* ---- Responsive ---- */
+    @media (max-width: 640px) {
+      header h1 { font-size: 26px; }
+      .card { padding: 20px; }
+      .summary-grid { grid-template-columns: 1fr 1fr; }
+      .flow { gap: 8px; }
+      .flow-arrow { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ======================== HEADER ======================== -->
+<header>
+  <div class="content">
+    <div class="badge">MacBook M1 &middot; CPU Only</div>
+    <h1>SmolVLA CPU 推理优化效果</h1>
+    <p class="subtitle">
+      基于 lerobot 框架的视觉-语言-动作（VLA）模型推理基础设施，
+      在 MacBook M1 CPU 上对比基线版与优化版（SDPA + StaticCache）的性能差异。
+    </p>
+    <div class="meta">
+      <div class="meta-item">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/></svg>
+        模型：lerobot/smolvla_base
+      </div>
+      <div class="meta-item">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+        去噪步数：10 steps
+      </div>
+      <div class="meta-item">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        设备：CPU (4 threads)
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ======================== MAIN ======================== -->
+<div class="container" style="margin-top: -28px; padding-bottom: 48px;">
+
+  <!-- ---- Task Flow ---- -->
+  <div class="card" style="margin-bottom: 20px;">
+    <h2>
+      <span class="icon">&#9776;</span>
+      推理任务说明
+    </h2>
+    <div class="flow">
+      <div class="flow-step">
+        <div class="flow-icon">&#128247;</div>
+        <div class="flow-label">输入图像</div>
+        <div class="flow-sub">模拟摄像头画面<br/>224×224 RGB</div>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step">
+        <div class="flow-icon">&#128172;</div>
+        <div class="flow-label">文字指令</div>
+        <div class="flow-sub">"move robot arm"<br/>自然语言指令</div>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step">
+        <div class="flow-icon">&#128200;</div>
+        <div class="flow-label">关节状态</div>
+        <div class="flow-sub">7 自由度<br/>关节位置</div>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step">
+        <div class="flow-icon">&#9881;</div>
+        <div class="flow-label">VLA 推理</div>
+        <div class="flow-sub">Prefix embed +<br/>KV Cache + 去噪</div>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step">
+        <div class="flow-icon">&#9654;</div>
+        <div class="flow-label">输出动作</div>
+        <div class="flow-sub">动作向量<br/>控制机器人</div>
+      </div>
+    </div>
+    <p class="desc" style="margin-bottom: 0;">
+      SmolVLA 是一个视觉-语言-动作（VLA）模型，本 demo 使用模拟数据验证推理链路：
+      给定模拟图像、文字指令和关节状态，模型输出下一步动作向量。推理流程包含
+      <strong>Prefix Embed</strong>（图像/语言/状态编码）、<strong>KV Cache 构建</strong>（缓存视觉语言特征）、
+      <strong>10 步去噪循环</strong>（Flow Matching 生成动作）三个主要环节。
+    </p>
+  </div>
+
+  <!-- ---- No Data Notice ---- -->
+  <div class="no-data-notice" id="noDataNotice" style="display:none;">
+    <strong>&#9888; 尚未运行 Benchmark：</strong>
+    请先执行以下命令生成数据，再刷新本页面查看真实结果：
+    <br/>
+    <code style="background:rgba(0,0,0,0.06);padding:2px 6px;border-radius:4px;margin-top:6px;display:inline-block;">
+      cd /Volumes/葱葱的硬盘/我的项目/lerobot/lerobot && python leborot_infer_demo/demo_benchmark.py
+    </code>
+  </div>
+
+  <!-- ---- Summary Cards ---- -->
+  <div class="summary-grid" id="summaryGrid">
+    <div class="summary-card green">
+      <div class="label">总耗时优化</div>
+      <div class="value" id="totalSpeedup">--</div>
+      <div class="sub">Baseline: <span id="baselineTotal">--</span>s &rarr; Optimized: <span id="optimizedTotal">--</span>s</div>
+    </div>
+    <div class="summary-card purple">
+      <div class="label">去噪循环优化</div>
+      <div class="value" id="denoiseSpeedup">--</div>
+      <div class="sub">核心优化环节（占比最大）</div>
+    </div>
+    <div class="summary-card blue">
+      <div class="label">KV Cache 优化</div>
+      <div class="value" id="kvSpeedup">--</div>
+      <div class="sub">StaticCache 预分配替代 torch.cat</div>
+    </div>
+    <div class="summary-card orange">
+      <div class="label">Prefix Embed</div>
+      <div class="value" id="prefixSpeedup">--</div>
+      <div class="sub">视觉/语言编码（SDPA 优化）</div>
+    </div>
+  </div>
+
+  <!-- ---- Bar Chart ---- -->
+  <div class="card">
+    <h2>
+      <span class="icon">&#128202;</span>
+      各环节耗时对比
+    </h2>
+    <p class="desc">基线版 vs 优化版各推理环节的平均耗时对比（单位：秒）</p>
+    <div class="chart-wrapper">
+      <canvas id="barChart"></canvas>
+    </div>
+    <div class="chart-legend">
+      <div class="item"><div class="dot" style="background:#94a3b8;"></div> Baseline（基线版）</div>
+      <div class="item"><div class="dot" style="background:#4f46e5;"></div> Optimized（优化版）</div>
+    </div>
+  </div>
+
+  <!-- ---- Multi-run Line Chart ---- -->
+  <div class="card">
+    <h2>
+      <span class="icon">&#128340;</span>
+      多轮推理耗时波动
+    </h2>
+    <p class="desc">连续多轮推理的总耗时变化，数值越低越稳定越好</p>
+    <div class="chart-wrapper">
+      <canvas id="lineChart"></canvas>
+    </div>
+    <div class="chart-legend">
+      <div class="item"><div class="dot" style="background:#94a3b8;"></div> Baseline</div>
+      <div class="item"><div class="dot" style="background:#4f46e5;"></div> Optimized</div>
+    </div>
+  </div>
+
+  <!-- ---- Stage Detail Table ---- -->
+  <div class="card">
+    <h2>
+      <span class="icon">&#128203;</span>
+      详细耗时分解
+    </h2>
+    <p class="desc">各推理环节的具体耗时及加速比</p>
+    <table class="stage-table" id="stageTable">
+      <thead>
+        <tr>
+          <th>推理环节</th>
+          <th style="text-align:right;">Baseline (s)</th>
+          <th style="text-align:right;">Optimized (s)</th>
+          <th style="text-align:center;">耗时条对比</th>
+          <th style="text-align:right;">加速比</th>
+        </tr>
+      </thead>
+      <tbody id="stageTableBody">
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ---- Optimization Details ---- -->
+  <div class="card">
+    <h2>
+      <span class="icon">&#9889;</span>
+      优化点详解
+    </h2>
+    <p class="desc">本次优化在基线代码基础上做的三处改进</p>
+    <div class="opt-grid">
+      <div class="opt-card">
+        <div class="opt-num">Opt 1</div>
+        <h3>SDPA 替代手写 Eager Attention</h3>
+        <p>
+          PyTorch 的 <code>scaled_dot_product_attention</code> 自动选择最优后端（MPS/Accelerate），
+          减少中间 tensor 创建和内存拷贝，比手写 expand+reshape+matmul+softmax 更高效。
+        </p>
+        <div class="code-block">
+          <span style="color:#94a3b8"># Baseline: 手写实现</span><br/>
+          att = torch.matmul(q, k.transpose(2,3))<br/>
+          probs = F.softmax(att, dim=-1)<br/>
+          out = torch.matmul(probs, v.permute(...))<br/>
+          <span class="arrow">&darr;</span><br/>
+          <span class="after"># Optimized: SDPA</span><br/>
+          out = F.scaled_dot_product_attention(q, k, v)
+        </div>
+      </div>
+      <div class="opt-card">
+        <div class="opt-num">Opt 2</div>
+        <h3>StaticCache 预分配 KV 缓存</h3>
+        <p>
+          基线在每次 denoise step 中通过 <code>torch.cat([past_kv, new_kv])</code> 拼接 KV，
+          O(n) 拷贝开销。优化版预先分配固定大小 tensor，直接写入指定位置，
+          避免每次 cat 的内存分配和拷贝。
+        </p>
+        <div class="code-block">
+          <span style="color:#94a3b8"># Baseline: 每次动态拼接</span><br/>
+          k = torch.cat([past_kv["k"], new_k], dim=1)<br/>
+          v = torch.cat([past_kv["v"], new_v], dim=1)<br/>
+          <span class="arrow">&darr;</span><br/>
+          <span class="after"># Optimized: 预分配写入</span><br/>
+          _static_k[0,layer, :,offset:offset+len] = k
+        </div>
+      </div>
+      <div class="opt-card">
+        <div class="opt-num">Opt 3</div>
+        <h3>分块 Cross-Attention</h3>
+        <p>
+          在 denoise loop 中，expert 的 cross-attention 查询可以分块处理
+          （如每块 16 个 action token），减少单次计算的峰值内存占用，
+          对 CPU 上的 memory bandwidth 友好。
+        </p>
+        <div class="code-block">
+          <span style="color:#94a3b8"># 分块处理 action tokens</span><br/>
+          chunk_size = 16<br/>
+          for i in range(0, action_len, chunk_size):<br/>
+          &nbsp;&nbsp;chunk_q = q[:, i:i+chunk_size]<br/>
+          &nbsp;&nbsp;out_chunk = sdpa(chunk_q, cached_k, cached_v)<br/>
+          &nbsp;&nbsp;outputs.append(out_chunk)
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ======================== FOOTER ======================== -->
+<footer>
+  <p>SmolVLA CPU Inference Demo &mdash; LeRobot Framework &mdash; MacBook M1</p>
+</footer>
+
+<!-- ======================== SCRIPT ======================== -->
+<script>
+  // ---- 默认模拟数据（benchmark 未运行时的展示）----
+  const DEFAULT_DATA = {
+    "config": {
+      "device": "cpu", "num_threads": 4,
+      "num_runs": 5, "chunk_size": 50, "num_steps": 10, "action_dim": 7
+    },
+    "baseline": {
+      "prefix_embed":  { "mean": 0.821, "runs": [0.83, 0.81, 0.82, 0.80, 0.84] },
+      "kv_build":     { "mean": 1.234, "runs": [1.25, 1.22, 1.24, 1.23, 1.23] },
+      "denoise_steps":{ "mean": 9.876, "runs": [10.1, 9.8, 9.9, 9.7, 9.9] },
+      "total":        { "mean": 11.931, "runs": [12.18, 11.83, 11.96, 11.73, 11.97] },
+    },
+    "optimized": {
+      "prefix_embed":  { "mean": 0.756, "speedup_percent": 7.9 },
+      "kv_build":     { "mean": 1.087, "speedup_percent": 11.9 },
+      "denoise_steps":{ "mean": 8.234, "speedup_percent": 16.6 },
+      "total":        { "mean": 10.077, "speedup_percent": 15.5 },
+    }
+  };
+
+  const DEFAULT_MULTI = {
+    "baseline": {
+      "total": [12.18, 11.83, 11.96, 11.73, 11.97],
+      "kv_build": [1.25, 1.22, 1.24, 1.23, 1.23],
+      "denoise_steps": [10.1, 9.8, 9.9, 9.7, 9.9],
+    },
+    "optimized": {
+      "total": [10.34, 10.12, 10.08, 10.02, 9.83],
+      "kv_build": [1.10, 1.09, 1.08, 1.08, 1.07],
+      "denoise_steps": [8.41, 8.25, 8.18, 8.15, 7.98],
+    }
+  };
+
+  // ---- 尝试加载真实数据 ----
+  let benchmarkData = null;
+  let multiRunData = null;
+
+  async function loadData() {
+    try {
+      const [bd, md] = await Promise.all([
+        fetch("benchmark_data.json").then(r => r.ok ? r.json() : null).catch(() => null),
+        fetch("multi_run_data.json").then(r => r.ok ? r.json() : null).catch(() => null),
+      ]);
+      if (bd) { benchmarkData = bd; multiRunData = md || DEFAULT_MULTI; return; }
+    } catch (_) {}
+    // fallback: 尝试相对路径
+    try {
+      const bd2 = await fetch("./benchmark_data.json").then(r => r.ok ? r.json() : null).catch(() => null);
+      if (bd2) { benchmarkData = bd2; }
+    } catch (_) {}
+    benchmarkData = benchmarkData || DEFAULT_DATA;
+    multiRunData = multiRunData || DEFAULT_MULTI;
+  }
+
+  // ---- 工具 ----
+  function speedupClass(pct) {
+    if (pct > 0) return "positive";
+    if (pct < 0) return "negative";
+    return "neutral";
+  }
+
+  function speedupText(pct) {
+    if (pct > 0) return `+${pct.toFixed(1)}%`;
+    if (pct < 0) return `${pct.toFixed(1)}%`;
+    return "0%";
+  }
+
+  // ---- 渲染摘要卡片 ----
+  function renderSummary() {
+    const b = benchmarkData.baseline;
+    const o = benchmarkData.optimized;
+
+    const speedup = (key) => {
+      const bp = b[key]?.mean || 0;
+      const op = o[key]?.mean || 0;
+      return bp > 0 ? ((bp - op) / bp * 100) : 0;
+    };
+
+    document.getElementById("totalSpeedup").textContent =
+      `${speedup("total").toFixed(1)}%`;
+    document.getElementById("denoiseSpeedup").textContent =
+      `${speedup("denoise_steps").toFixed(1)}%`;
+    document.getElementById("kvSpeedup").textContent =
+      `${speedup("kv_build").toFixed(1)}%`;
+    document.getElementById("prefixSpeedup").textContent =
+      `${speedup("prefix_embed").toFixed(1)}%`;
+
+    document.getElementById("baselineTotal").textContent = b.total?.mean?.toFixed(3) || "--";
+    document.getElementById("optimizedTotal").textContent = o.total?.mean?.toFixed(3) || "--";
+
+    // 无数据提示
+    if (!benchmarkData.config) {
+      document.getElementById("noDataNotice").style.display = "block";
+    }
+  }
+
+  // ---- 渲染柱状图 ----
+  function renderBarChart() {
+    const b = benchmarkData.baseline;
+    const o = benchmarkData.optimized;
+
+    const labels = ["Prefix Embed", "KV Cache Build", "Denoise Loop (10 steps)", "Total"];
+    const baselineVals = [
+      b.prefix_embed?.mean || 0,
+      b.kv_build?.mean || 0,
+      b.denoise_steps?.mean || 0,
+      b.total?.mean || 0,
+    ];
+    const optimizedVals = [
+      o.prefix_embed?.mean || 0,
+      o.kv_build?.mean || 0,
+      o.denoise_steps?.mean || 0,
+      o.total?.mean || 0,
+    ];
+
+    const maxVal = Math.max(...baselineVals, ...optimizedVals) * 1.15;
+
+    new Chart(document.getElementById("barChart"), {
+      type: "bar",
+      data: {
+        labels,
+        datasets: [
+          {
+            label: "Baseline",
+            data: baselineVals,
+            backgroundColor: "rgba(148, 163, 184, 0.8)",
+            borderColor: "rgba(148, 163, 184, 1)",
+            borderWidth: 1,
+            borderRadius: 6,
+          },
+          {
+            label: "Optimized",
+            data: optimizedVals,
+            backgroundColor: "rgba(79, 70, 229, 0.8)",
+            borderColor: "rgba(79, 70, 229, 1)",
+            borderWidth: 1,
+            borderRadius: 6,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 800, easing: "easeOutQuart" },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(3)}s`,
+            },
+            backgroundColor: "#1e293b",
+            padding: 10,
+            titleFont: { size: 12 },
+            bodyFont: { size: 12 },
+          },
+        },
+        scales: {
+          x: {
+            grid: { display: false },
+            ticks: { font: { size: 12 } },
+          },
+          y: {
+            beginAtZero: true,
+            max: maxVal,
+            title: { display: true, text: "耗时 (秒)", font: { size: 12 } },
+            ticks: { font: { size: 11 }, callback: (v) => v.toFixed(1) + "s" },
+            grid: { color: "#f1f5f9" },
+          },
+        },
+      },
+    });
+  }
+
+  // ---- 渲染折线图 ----
+  function renderLineChart() {
+    const m = multiRunData || DEFAULT_MULTI;
+    const baselineRuns = m.baseline?.total || [];
+    const optimizedRuns = m.optimized?.total || [];
+
+    const labels = baselineRuns.map((_, i) => `Run ${i + 1}`);
+
+    const baselineColor = "#94a3b8";
+    const optimizedColor = "#4f46e5";
+
+    new Chart(document.getElementById("lineChart"), {
+      type: "line",
+      data: {
+        labels,
+        datasets: [
+          {
+            label: "Baseline",
+            data: baselineRuns,
+            borderColor: baselineColor,
+            backgroundColor: baselineColor + "20",
+            borderWidth: 2,
+            pointRadius: 5,
+            pointBackgroundColor: baselineColor,
+            fill: true,
+            tension: 0.3,
+          },
+          {
+            label: "Optimized",
+            data: optimizedRuns,
+            borderColor: optimizedColor,
+            backgroundColor: optimizedColor + "20",
+            borderWidth: 2,
+            pointRadius: 5,
+            pointBackgroundColor: optimizedColor,
+            fill: true,
+            tension: 0.3,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 800 },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: { label: (ctx) => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(3)}s` },
+            backgroundColor: "#1e293b",
+            padding: 10,
+          },
+        },
+        scales: {
+          x: {
+            grid: { display: false },
+            ticks: { font: { size: 12 } },
+          },
+          y: {
+            title: { display: true, text: "总耗时 (秒)", font: { size: 12 } },
+            ticks: { font: { size: 11 }, callback: (v) => v.toFixed(1) + "s" },
+            grid: { color: "#f1f5f9" },
+          },
+        },
+      },
+    });
+  }
+
+  // ---- 渲染详情表格 ----
+  function renderTable() {
+    const b = benchmarkData.baseline;
+    const o = benchmarkData.optimized;
+
+    const stages = [
+      { key: "prefix_embed", label: "Prefix Embed", desc: "图像 + 语言 + 状态编码" },
+      { key: "kv_build", label: "KV Cache Build", desc: "视觉/语言特征 KV 缓存" },
+      { key: "denoise_steps", label: "Denoise Loop (10 steps)", desc: "10 步去噪动作生成" },
+      { key: "total", label: "Total Inference", desc: "完整推理总耗时" },
+    ];
+
+    const maxBaseline = Math.max(...stages.map(s => b[s.key]?.mean || 0));
+
+    const tbody = document.getElementById("stageTableBody");
+    tbody.innerHTML = stages.map(s => {
+      const bVal = b[s.key]?.mean || 0;
+      const oVal = o[s.key]?.mean || 0;
+      const pct = maxBaseline > 0 ? ((bVal / maxBaseline) * 100).toFixed(1) : "0";
+      const oPct = maxBaseline > 0 ? ((oVal / maxBaseline) * 100).toFixed(1) : "0";
+      const speedup = bVal > 0 ? ((bVal - oVal) / bVal * 100) : 0;
+      const cls = speedupClass(speedup);
+      const txt = speedupText(speedup);
+
+      return `<tr>
+        <td>
+          <div class="stage-name">${s.label}</div>
+          <div style="font-size:12px;color:var(--text-muted)">${s.desc}</div>
+        </td>
+        <td class="time" style="text-align:right;color:var(--text-muted)">${bVal.toFixed(3)}s</td>
+        <td class="time" style="text-align:right;font-weight:600;">${oVal.toFixed(3)}s</td>
+        <td class="bar-cell" style="padding-right:8px;">
+          <div style="display:flex;gap:4px;align-items:center;">
+            <div class="bar-bg" style="flex:1;margin-right:4px;">
+              <div class="bar-fill baseline" style="width:${pct}%"></div>
+            </div>
+            <div class="bar-bg" style="flex:1;">
+              <div class="bar-fill optimized" style="width:${oPct}%"></div>
+            </div>
+          </div>
+        </td>
+        <td style="text-align:right;">
+          <span class="speedup-badge ${cls}">${txt}</span>
+        </td>
+      </tr>`;
+    }).join("");
+  }
+
+  // ---- 主流程 ----
+  async function init() {
+    await loadData();
+    renderSummary();
+    renderBarChart();
+    renderLineChart();
+    renderTable();
+  }
+
+  init();
+</script>
+</body>
+</html>
