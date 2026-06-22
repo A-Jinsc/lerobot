@@ -51,14 +51,55 @@ def apply_rope(x, positions, max_wavelength=10_000):
 
     radians = radians[..., None, :]
 
-    sin = torch.sin(radians)  # .to(dtype=dtype)
-    cos = torch.cos(radians)  # .to(dtype=dtype)
+    sin = torch.sin(radians)
+    cos = torch.cos(radians)
 
     x1, x2 = x.split(d_half, dim=-1)
     res = torch.empty_like(x)
     res[..., :d_half] = x1 * cos - x2 * sin
     res[..., d_half:] = x2 * cos + x1 * sin
 
+    return res.to(dtype)
+
+
+def build_rope_cache(max_seq_len, head_dim, device, max_wavelength=10_000):
+    d_half = head_dim // 2
+    freq_exponents = (2.0 / head_dim) * torch.arange(d_half, dtype=torch.float32, device=device)
+    timescale = max_wavelength**freq_exponents
+    positions = torch.arange(max_seq_len, dtype=torch.float32, device=device)
+    radians = positions[:, None] / timescale[None, :]  # (max_seq_len, d_half)
+    cos = torch.cos(radians)  # (max_seq_len, d_half)
+    sin = torch.sin(radians)  # (max_seq_len, d_half)
+    return torch.stack([sin, cos], dim=-1).permute(1, 0, 2)  # (d_half, max_seq_len, 2)
+
+
+def apply_rope_cached(x, positions, rope_cache):
+    """
+    Cached RoPE: look up precomputed sin/cos from rope_cache.
+    Falls back to dynamic RoPE if positions exceed the cache range.
+    rope_cache: (d_half, max_seq_len, 2) — [sin, cos] per head-dim and position.
+    """
+    max_pos = positions.long().max().item()
+    if rope_cache is None or max_pos >= rope_cache.shape[1]:
+        # Fallback to dynamic RoPE
+        return apply_rope(x, positions)
+
+    d_half = x.shape[-1] // 2
+    dtype = x.dtype
+    x = x.to(torch.float32)
+
+    seq_len = positions.shape[1]
+    pos_int = positions.long()  # (B, seq_len)
+    sc = rope_cache[:d_half, :, :]  # (d_half, max_seq_len, 2)
+    sin = sc[:, pos_int[0], 0].permute(1, 0)  # (seq_len, d_half)
+    cos = sc[:, pos_int[0], 1].permute(1, 0)  # (seq_len, d_half)
+    sin = sin.unsqueeze(0).unsqueeze(-2)  # (1, seq_len, 1, d_half)
+    cos = cos.unsqueeze(0).unsqueeze(-2)  # (1, seq_len, 1, d_half)
+
+    x1, x2 = x.split(d_half, dim=-1)
+    res = torch.empty_like(x)
+    res[..., :d_half] = x1 * cos - x2 * sin
+    res[..., d_half:] = x2 * cos + x1 * sin
     return res.to(dtype)
 
 
@@ -82,6 +123,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        processor=None,
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
@@ -96,7 +138,7 @@ class SmolVLMWithExpertModel(nn.Module):
         else:
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.processor = processor if processor is not None else AutoProcessor.from_pretrained(model_id)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
@@ -218,6 +260,11 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         fill_kv_cache: bool = True,
         past_key_values=None,
+        rope_cache=None,
+        static_k=None,
+        static_v=None,
+        static_offset=0,
+        use_static_cache=False,
     ) -> list[torch.Tensor]:
         query_states = []
         key_states = []
@@ -226,6 +273,9 @@ class SmolVLMWithExpertModel(nn.Module):
             layer = model_layers[i][layer_idx]
             if hidden_states is None or layer is None:
                 continue
+            # Add batch dim if missing: (L, D) -> (1, L, D)
+            if hidden_states.ndim == 2:
+                hidden_states = hidden_states.unsqueeze(0)
             hidden_states = layer.input_layernorm(hidden_states)
 
             input_shape = hidden_states.shape[:-1]
@@ -256,25 +306,56 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_mask_ = _attention_mask
         position_ids_ = _position_ids
 
-        query_states = apply_rope(query_states, position_ids_)
-        key_states = apply_rope(key_states, position_ids_)
+        if rope_cache is not None:
+            query_states = apply_rope_cached(query_states, position_ids_, rope_cache)
+            key_states = apply_rope_cached(key_states, position_ids_, rope_cache)
+        else:
+            query_states = apply_rope(query_states, position_ids_)
+            key_states = apply_rope(key_states, position_ids_)
 
         if use_cache and past_key_values is None:
             past_key_values = {}
 
         if use_cache:
             if fill_kv_cache:
-                past_key_values[layer_idx] = {
-                    "key_states": key_states,
-                    "value_states": value_states,
-                }
+                if use_static_cache and static_k is not None:
+                    kv_len = key_states.shape[1]
+                    # key_states: (B, seq_len, H, D), static_k: (B, layers, H, seq_len, D)
+                    # Transpose to match static_k layout
+                    key_states_T = key_states.transpose(1, 2)  # (B, H, seq_len, D)
+                    value_states_T = value_states.transpose(1, 2)  # (B, H, seq_len, D)
+                    static_k[:, layer_idx, :, static_offset : static_offset + kv_len, :] = key_states_T
+                    static_v[:, layer_idx, :, static_offset : static_offset + kv_len, :] = value_states_T
+                    # Read back accumulated KV: up to static_offset + kv_len
+                    end_offset = static_offset + kv_len
+                    key_states_out = static_k[:, layer_idx, :, :end_offset, :].transpose(1, 2)  # (B, end_offset, H, D)
+                    value_states_out = static_v[:, layer_idx, :, :end_offset, :].transpose(1, 2)
+                    past_key_values[layer_idx] = {
+                        "key_states": key_states_out,
+                        "value_states": value_states_out,
+                        "kv_len": end_offset,
+                    }
+                else:
+                    past_key_values[layer_idx] = {
+                        "key_states": key_states,
+                        "value_states": value_states,
+                    }
             else:
                 # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
                 # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
                 # the max len, then we (for instance) double the cache size. This implementation already exists
                 # in `transformers`. (molbap)
-                key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
-                value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+                if use_static_cache and static_k is not None:
+                    # Read from pre-allocated cache
+                    past_len = past_key_values[layer_idx]["kv_len"]
+                    key_states_in = past_key_values[layer_idx]["key_states"][:, :past_len]
+                    value_states_in = past_key_values[layer_idx]["value_states"][:, :past_len]
+                    key_states = torch.cat([key_states_in, key_states], dim=1)
+                    value_states = torch.cat([value_states_in, value_states], dim=1)
+                    past_key_values[layer_idx]["kv_len"] = key_states.shape[1]
+                else:
+                    key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
+                    value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
 
         attention_interface = self.get_attention_interface()
 
@@ -295,6 +376,11 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         fill_kv_cache: bool = True,
         past_key_values=None,
+        rope_cache=None,
+        static_k=None,
+        static_v=None,
+        static_offset=0,
+        use_static_cache=False,
     ) -> list[torch.Tensor]:
         attention_interface = self.get_attention_interface()
 
@@ -322,14 +408,22 @@ class SmolVLMWithExpertModel(nn.Module):
             value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
 
             # B,L,H,D with L sequence length, H number of heads, D head dim
-            query_states = apply_rope(query_state, position_id)
-            key_states = apply_rope(key_state, position_id)
+            if rope_cache is not None:
+                query_states = apply_rope_cached(query_state, position_id, rope_cache)
+                key_states = apply_rope_cached(key_state, position_id, rope_cache)
+            else:
+                query_states = apply_rope(query_state, position_id)
+                key_states = apply_rope(key_state, position_id)
 
             att_output = attention_interface(
                 prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
             )
             att_outputs.append(att_output)
+
         else:
+            # The expert queries the cached VLM prefix KV.  Do not generate KV
+            # from the expert suffix here: cross-attention projections expect
+            # flattened VLM KV states, not expert hidden states.
             expert_position_id = position_ids
 
         if use_cache and past_key_values is None:
@@ -337,17 +431,39 @@ class SmolVLMWithExpertModel(nn.Module):
 
         if use_cache:
             if fill_kv_cache:
-                past_key_values[layer_idx] = {
-                    "key_states": key_states,
-                    "value_states": value_states,
-                }
+                if use_static_cache and static_k is not None:
+                    # Write prefix KV to static cache
+                    kv_len = key_states.shape[1]
+                    key_states_T = key_states.transpose(1, 2)
+                    value_states_T = value_states.transpose(1, 2)
+                    static_k[:, layer_idx, :, static_offset : static_offset + kv_len, :] = key_states_T
+                    static_v[:, layer_idx, :, static_offset : static_offset + kv_len, :] = value_states_T
+                    end_offset = static_offset + kv_len
+                    # Return accumulated prefix KV
+                    key_states_out = static_k[:, layer_idx, :, :end_offset, :].transpose(1, 2)
+                    value_states_out = static_v[:, layer_idx, :, :end_offset, :].transpose(1, 2)
+                    past_key_values[layer_idx] = {
+                        "key_states": key_states_out,
+                        "value_states": value_states_out,
+                        "kv_len": end_offset,
+                    }
+                else:
+                    past_key_values[layer_idx] = {
+                        "key_states": key_states,
+                        "value_states": value_states,
+                    }
             else:
-                # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
-                # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
-                # the max len, then we (for instance) double the cache size. This implementation already exists
-                # in `transformers`. (molbap)
-                key_states = past_key_values[layer_idx]["key_states"]
-                value_states = past_key_values[layer_idx]["value_states"]
+                if use_static_cache and static_k is not None:
+                    # Read the VLM prefix KV from the pre-allocated cache.
+                    past_len = past_key_values[layer_idx]["kv_len"]
+                    key_states_in = past_key_values[layer_idx]["key_states"][:, :past_len]
+                    value_states_in = past_key_values[layer_idx]["value_states"][:, :past_len]
+                    key_states = key_states_in
+                    value_states = value_states_in
+                else:
+                    # No static cache: read the VLM prefix KV from the dict cache.
+                    key_states = past_key_values[layer_idx]["key_states"]
+                    value_states = past_key_values[layer_idx]["value_states"]
 
         # Expert
         expert_layer = model_layers[1][layer_idx]
@@ -360,14 +476,14 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
             expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
 
-            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
+            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).reshape(
                 *key_states.shape[:2], -1
             )
             expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
                 *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )  # k_proj should have same dim as kv
 
-            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
+            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).reshape(
                 *value_states.shape[:2], -1
             )
             expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
@@ -376,10 +492,10 @@ class SmolVLMWithExpertModel(nn.Module):
 
             expert_position_id = (
                 expert_position_id - torch.min(expert_position_id, dim=1, keepdim=True).values
-            )  # start from 0
+            )
             expert_attention_mask = attention_mask[
-                :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
-            ]  # take into account kv
+                :, -inputs_embeds[1].shape[1] :, : key_states.shape[1]
+            ]  # suffix rows, key_states columns
 
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
@@ -420,6 +536,11 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        rope_cache=None,
+        static_k=None,
+        static_v=None,
+        static_offset=0,
+        use_static_cache=False,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -451,6 +572,11 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
                     past_key_values=past_key_values,
+                    rope_cache=rope_cache,
+                    static_k=static_k,
+                    static_v=static_v,
+                    static_offset=static_offset,
+                    use_static_cache=use_static_cache,
                 )
             else:
                 att_outputs, past_key_values = self.forward_cross_attn_layer(
@@ -464,6 +590,11 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
                     past_key_values=past_key_values,
+                    rope_cache=rope_cache,
+                    static_k=static_k,
+                    static_v=static_v,
+                    static_offset=static_offset,
+                    use_static_cache=use_static_cache,
                 )
             outputs_embeds = []
             start = 0

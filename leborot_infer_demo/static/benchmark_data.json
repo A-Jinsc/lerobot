@@ -1,0 +1,129 @@
+{
+  "config": {
+    "device": "cpu",
+    "num_threads": 4,
+    "num_runs": 3,
+    "chunk_size": 50,
+    "num_steps": 10,
+    "action_dim": 32
+  },
+  "baseline": {
+    "prefix_embed": {
+      "mean": 4.9081,
+      "min": 4.805,
+      "max": 5.0075,
+      "std": 0.1013,
+      "runs": [
+        4.9118,
+        5.0075,
+        4.805
+      ]
+    },
+    "kv_build": {
+      "mean": 0.4413,
+      "min": 0.4084,
+      "max": 0.4905,
+      "std": 0.0434,
+      "runs": [
+        0.4905,
+        0.4084,
+        0.4251
+      ]
+    },
+    "denoise_steps": {
+      "mean": 1.4926,
+      "min": 1.4295,
+      "max": 1.552,
+      "std": 0.0613,
+      "runs": [
+        1.4962,
+        1.552,
+        1.4295
+      ]
+    },
+    "total": {
+      "mean": 6.8424,
+      "min": 6.6597,
+      "max": 6.968,
+      "std": 0.1619,
+      "runs": [
+        6.8995,
+        6.968,
+        6.6597
+      ]
+    },
+    "per_denoise_step": {
+      "mean": 0.1493,
+      "min": 0.143,
+      "max": 0.1552,
+      "std": 0.0061,
+      "runs": [
+        0.1496,
+        0.1552,
+        0.143
+      ]
+    }
+  },
+  "optimized": {
+    "prefix_embed": {
+      "mean": 4.8287,
+      "min": 4.8151,
+      "max": 4.8434,
+      "std": 0.0142,
+      "runs": [
+        4.8277,
+        4.8434,
+        4.8151
+      ],
+      "speedup_percent": 1.6
+    },
+    "kv_build": {
+      "mean": 0.3617,
+      "min": 0.3582,
+      "max": 0.3685,
+      "std": 0.0059,
+      "runs": [
+        0.3685,
+        0.3582,
+        0.3585
+      ],
+      "speedup_percent": 18.0
+    },
+    "denoise_steps": {
+      "mean": 1.3728,
+      "min": 1.2893,
+      "max": 1.4306,
+      "std": 0.0741,
+      "runs": [
+        1.2893,
+        1.4306,
+        1.3986
+      ],
+      "speedup_percent": 8.0
+    },
+    "total": {
+      "mean": 6.5633,
+      "min": 6.4855,
+      "max": 6.6322,
+      "std": 0.0737,
+      "runs": [
+        6.4855,
+        6.6322,
+        6.5722
+      ],
+      "speedup_percent": 4.1
+    },
+    "per_denoise_step": {
+      "mean": 0.1373,
+      "min": 0.1289,
+      "max": 0.1431,
+      "std": 0.0074,
+      "runs": [
+        0.1289,
+        0.1431,
+        0.1399
+      ],
+      "speedup_percent": 8.0
+    }
+  }
+}

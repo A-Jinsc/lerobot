@@ -245,7 +245,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         self.init_rtc_processor()
-        self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        processor = kwargs.pop("processor", None)
+        _model = kwargs.pop("_model", None)
+        if _model is not None:
+            self.model = _model
+        else:
+            self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor, processor=processor)
         self.reset()
 
     def reset(self):
@@ -564,7 +569,7 @@ class VLAFlowMatching(nn.Module):
     └──────────────────────────────┘
     """
 
-    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None, processor=None):
         super().__init__()
         self.config = config
 
@@ -579,6 +584,7 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            processor=processor,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size

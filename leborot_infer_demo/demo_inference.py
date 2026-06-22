@@ -22,6 +22,9 @@ SmolVLA CPU Inference Demo
 """
 
 import argparse
+import json
+import os
+import statistics
 import time
 import torch
 import torch.nn.functional as F
@@ -86,7 +89,7 @@ def pad_tensor(tensor, max_len, pad_value=0):
 # 基线版本 Attention（来自 smolvlm_with_expert.py，原样保留）
 # ============================================================================
 
-def baseline_eager_attention_forward(num_attention_heads, num_key_value_heads, head_dim, attention_mask, query_states, key_states, value_states):
+def baseline_eager_attention_forward(num_attention_heads, num_key_value_heads, attention_mask, batch_size, head_dim, query_states, key_states, value_states):
     num_key_value_groups = num_attention_heads // num_key_value_heads
     b, sequence_length = key_states.shape[:2]
 
@@ -122,8 +125,21 @@ def optimized_sdpa_attention_forward(num_attention_heads, num_key_value_heads, h
     num_key_value_groups = num_attention_heads // num_key_value_heads
     b, seq_k = key_states.shape[:2]
 
-    key_states = key_states.view(b, seq_k, num_key_value_heads, num_key_value_groups, head_dim).transpose(1, 2)
-    value_states = value_states.view(b, seq_k, num_key_value_heads, num_key_value_groups, head_dim).transpose(1, 2)
+    key_states = key_states[:, :, :, None, :].expand(
+        b, seq_k, num_key_value_heads, num_key_value_groups, head_dim
+    )
+    key_states = key_states.reshape(b, seq_k, num_key_value_heads * num_key_value_groups, head_dim)
+    key_states = key_states.transpose(1, 2)
+
+    value_states = value_states[:, :, :, None, :].expand(
+        b, seq_k, num_key_value_heads, num_key_value_groups, head_dim
+    )
+    value_states = value_states.reshape(b, seq_k, num_key_value_heads * num_key_value_groups, head_dim)
+    value_states = value_states.transpose(1, 2)
+
+    key_states = key_states.to(dtype=query_states.dtype)
+    value_states = value_states.to(dtype=query_states.dtype)
+
     query_states = query_states.transpose(1, 2)
 
     att_output = F.scaled_dot_product_attention(
@@ -149,12 +165,13 @@ class BaselineVLAFlowMatching(VLAFlowMatching):
         self._patch_attention_interface()
 
     def _patch_attention_interface(self):
-        def baseline_attention_interface(q, k, v, attn_mask, batch_size, head_dim):
+        cfg = self.vlm_with_expert
+        num_attn = cfg.num_attention_heads
+        num_kv = cfg.num_key_value_heads
+
+        def baseline_attention_interface(attn_mask, batch_size, head_dim, q, k, v):
             return baseline_eager_attention_forward(
-                self.vlm_with_expert.num_attention_heads,
-                self.vlm_with_expert.num_key_value_heads,
-                self.vlm_with_expert.vlm.config.text_config.head_dim,
-                attn_mask, q, k, v
+                num_attn, num_kv, attn_mask, batch_size, head_dim, q, k, v
             )
         self.vlm_with_expert.get_attention_interface = lambda: baseline_attention_interface
 
@@ -206,12 +223,13 @@ class OptimizedVLAFlowMatching(VLAFlowMatching):
         self._static_k_offset = 0
 
     def _patch_to_optimized(self):
-        def sdpa_attention_interface(q, k, v, attn_mask, batch_size, head_dim):
+        cfg = self.vlm_with_expert
+        num_attn = cfg.num_attention_heads
+        num_kv = cfg.num_key_value_heads
+
+        def sdpa_attention_interface(attn_mask, batch_size, head_dim, q, k, v):
             return optimized_sdpa_attention_forward(
-                self.vlm_with_expert.num_attention_heads,
-                self.vlm_with_expert.num_key_value_heads,
-                self.vlm_with_expert.vlm.config.text_config.head_dim,
-                attn_mask, q, k, v
+                num_attn, num_kv, head_dim, attn_mask, q, k, v
             )
         self.vlm_with_expert.get_attention_interface = lambda: sdpa_attention_interface
 
@@ -231,11 +249,13 @@ class OptimizedVLAFlowMatching(VLAFlowMatching):
         b, seq_len = key_states.shape[0], key_states.shape[1]
         cached_len = self._static_k_offset
         if cached_len >= seq_len:
-            cached_k = self._static_k[0, layer_idx, :, :cached_len]
-            cached_v = self._static_v[0, layer_idx, :, :cached_len]
+            cached_k = self._static_k[0, :, :cached_len, :]
+            cached_v = self._static_v[0, :, :cached_len, :]
         else:
-            cached_k = self._static_k[0, layer_idx, :, :seq_len]
-            cached_v = self._static_v[0, layer_idx, :, :seq_len]
+            cached_k = self._static_k[0, :, :seq_len, :]
+            cached_v = self._static_v[0, :, :seq_len, :]
+        cached_k = cached_k.permute(0, 1, 2).unsqueeze(0).expand(b, -1, -1, -1)
+        cached_v = cached_v.permute(0, 1, 2).unsqueeze(0).expand(b, -1, -1, -1)
         return cached_k, cached_v
 
 
@@ -405,7 +425,7 @@ def run_optimized_inference(policy, batch, num_runs=3):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         with torch.no_grad():
-            _, _ = policy.model.vlm_with_expert.forward(
+            _, past_key_values = policy.model.vlm_with_expert.forward(
                 attention_mask=prefix_att_2d_masks,
                 position_ids=prefix_position_ids,
                 past_key_values=None,
@@ -444,10 +464,10 @@ def run_optimized_inference(policy, batch, num_runs=3):
                 prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
                 position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-                outputs_embeds, _ = policy.model.vlm_with_expert.forward(
+                outputs_embeds, past_key_values = policy.model.vlm_with_expert.forward(
                     attention_mask=full_att_2d_masks,
                     position_ids=position_ids,
-                    past_key_values=None,
+                    past_key_values=past_key_values,
                     inputs_embeds=[None, suffix_embs],
                     use_cache=policy.config.use_cache,
                     fill_kv_cache=False,
@@ -465,6 +485,60 @@ def run_optimized_inference(policy, batch, num_runs=3):
         timings["total"].append(t_end - t_start)
 
     return timings
+
+
+def save_benchmark_results(baseline_timings, optimized_timings, policy, num_runs):
+    """Write the latest demo timings for static/benchmark.html."""
+    stage_keys = ("prefix_embed", "kv_build", "denoise_steps", "total")
+
+    def stage_stats(timings, key):
+        values = timings[key] if timings is not None else []
+        if not values:
+            return {"mean": 0.0, "min": 0.0, "max": 0.0, "std": 0.0, "runs": []}
+        return {
+            "mean": round(statistics.mean(values), 4),
+            "min": round(min(values), 4),
+            "max": round(max(values), 4),
+            "std": round(statistics.stdev(values) if len(values) > 1 else 0.0, 4),
+            "runs": [round(value, 4) for value in values],
+        }
+
+    def results_for(timings):
+        result = {key: stage_stats(timings, key) for key in stage_keys}
+        per_step = [value / policy.config.num_steps for value in (timings or {}).get("denoise_steps", [])]
+        result["per_denoise_step"] = stage_stats({"per_denoise_step": per_step}, "per_denoise_step")
+        return result
+
+    baseline = results_for(baseline_timings)
+    optimized = results_for(optimized_timings)
+    for key, baseline_stage in baseline.items():
+        baseline_mean = baseline_stage["mean"]
+        optimized_mean = optimized[key]["mean"]
+        optimized[key]["speedup_percent"] = round(
+            (baseline_mean - optimized_mean) / baseline_mean * 100 if baseline_mean else 0.0, 1
+        )
+
+    results = {
+        "config": {
+            "device": str(DEVICE), "num_threads": torch.get_num_threads(), "num_runs": num_runs,
+            "chunk_size": policy.config.chunk_size, "num_steps": policy.config.num_steps,
+            "action_dim": policy.config.max_action_dim,
+        },
+        "baseline": baseline,
+        "optimized": optimized,
+    }
+    multi_run_data = {
+        name: {key: (timings or {}).get(key, []) for key in ("total", "kv_build", "denoise_steps")}
+        for name, timings in (("baseline", baseline_timings), ("optimized", optimized_timings))
+    }
+
+    static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    os.makedirs(static_dir, exist_ok=True)
+    for filename, data in (("benchmark_data.json", results), ("multi_run_data.json", multi_run_data)):
+        path = os.path.join(static_dir, filename)
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, ensure_ascii=False)
+        print(f"Results saved to: {path}")
 
 
 # ============================================================================
@@ -514,6 +588,8 @@ def main():
     optimized_policy.eval()
 
     print(f"\nRunning inference (num_runs={args.num_runs})...")
+    baseline_timings = None
+    optimized_timings = None
 
     # 基线版本
     if args.mode in ("baseline", "both"):
@@ -564,6 +640,7 @@ def main():
         print(f"  Denoise Loop:   {avg(timings['denoise_steps']):.4f}s")
         print(f"  Total:          {avg(timings['total']):.4f}s")
 
+    save_benchmark_results(baseline_timings, optimized_timings, base_policy, args.num_runs)
 
 if __name__ == "__main__":
     main()

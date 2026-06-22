@@ -622,36 +622,30 @@
 
 <!-- ======================== SCRIPT ======================== -->
 <script>
-  // ---- 默认模拟数据（benchmark 未运行时的展示）----
+  // ---- 默认值：未能读取 JSON 时页面全部显示为 0 ----
   const DEFAULT_DATA = {
     "config": {
-      "device": "cpu", "num_threads": 4,
-      "num_runs": 5, "chunk_size": 50, "num_steps": 10, "action_dim": 7
+      "device": "cpu", "num_threads": 0,
+      "num_runs": 0, "chunk_size": 0, "num_steps": 0, "action_dim": 0
     },
     "baseline": {
-      "prefix_embed":  { "mean": 0.821, "runs": [0.83, 0.81, 0.82, 0.80, 0.84] },
-      "kv_build":     { "mean": 1.234, "runs": [1.25, 1.22, 1.24, 1.23, 1.23] },
-      "denoise_steps":{ "mean": 9.876, "runs": [10.1, 9.8, 9.9, 9.7, 9.9] },
-      "total":        { "mean": 11.931, "runs": [12.18, 11.83, 11.96, 11.73, 11.97] },
+      "prefix_embed": { "mean": 0, "runs": [] }, "kv_build": { "mean": 0, "runs": [] },
+      "denoise_steps": { "mean": 0, "runs": [] }, "per_denoise_step": { "mean": 0, "runs": [] },
+      "total": { "mean": 0, "runs": [] }
     },
     "optimized": {
-      "prefix_embed":  { "mean": 0.756, "speedup_percent": 7.9 },
-      "kv_build":     { "mean": 1.087, "speedup_percent": 11.9 },
-      "denoise_steps":{ "mean": 8.234, "speedup_percent": 16.6 },
-      "total":        { "mean": 10.077, "speedup_percent": 15.5 },
+      "prefix_embed": { "mean": 0, "speedup_percent": 0 }, "kv_build": { "mean": 0, "speedup_percent": 0 },
+      "denoise_steps": { "mean": 0, "speedup_percent": 0 }, "per_denoise_step": { "mean": 0, "speedup_percent": 0 },
+      "total": { "mean": 0, "speedup_percent": 0 }
     }
   };
 
   const DEFAULT_MULTI = {
     "baseline": {
-      "total": [12.18, 11.83, 11.96, 11.73, 11.97],
-      "kv_build": [1.25, 1.22, 1.24, 1.23, 1.23],
-      "denoise_steps": [10.1, 9.8, 9.9, 9.7, 9.9],
+      "total": [], "kv_build": [], "denoise_steps": [],
     },
     "optimized": {
-      "total": [10.34, 10.12, 10.08, 10.02, 9.83],
-      "kv_build": [1.10, 1.09, 1.08, 1.08, 1.07],
-      "denoise_steps": [8.41, 8.25, 8.18, 8.15, 7.98],
+      "total": [], "kv_build": [], "denoise_steps": [],
     }
   };
 

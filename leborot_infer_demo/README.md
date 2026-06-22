@@ -1,4 +1,4 @@
-# SmolVLA CPU 推理演示与优化
+# SmolVLA 推理说明
 
 在 MacBook M1 CPU 上运行 SmolVLA 视觉-语言-动作（VLA）模型的推理 demo，包含性能优化对比。
 
@@ -7,26 +7,33 @@
 ### 1. 创建 conda 环境（推荐）
 
 ```bash
-conda create -n smolvla python=3.10
-conda activate smolvla
+conda create -n lerobot python=3.12 -y
+conda activate lerobot
 ```
 
 ### 2. 安装 lerobot 及其依赖
 
 ```bash
-cd /Volumes/葱葱的硬盘/我的项目/lerobot/lerobot
+git clone https://github.com/huggingface/lerobot.git
+cd lerobot
 
-# 安装 lerobot（含 smolvla 依赖）
+pip install -U pip setuptools wheel
 pip install -e ".[smolvla]"
-
-# macOS 额外依赖（如果提示缺包）
-pip install torch
 ```
 
-### 3. 验证环境
+### 3. 配置并验证环境
 
 ```bash
-python -c "from lerobot.policies.smolvla import SmolVLAPolicy; print('OK')"
+#配置环境变量使用cpu
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+export CUDA_VISIBLE_DEVICES=""
+
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("mps:", torch.backends.mps.is_available())
+print("cuda:", torch.cuda.is_available())
+PY
 ```
 
 ## 推理任务说明
@@ -39,7 +46,7 @@ SmolVLA 是一个 VLA（Vision-Language-Action）模型，接收：
 
 输出：机器人下一步的动作向量（各关节的目标角度）。
 
-**本 demo 使用模拟数据验证推理链路**（无需真实机器人）：
+**本 demo 使用模拟数据验证推理链路**：
 
 - 模拟图片：随机生成 224×224 RGB 图像
 - 模拟指令：固定文字 "move the robot arm"
@@ -50,14 +57,9 @@ SmolVLA 是一个 VLA（Vision-Language-Action）模型，接收：
 > 重要：以下所有脚本需要在 `lerobot/` 目录下运行（即包含 `src/` 文件夹的目录），或设置 `PYTHONPATH`。
 
 ```bash
-# 设置 Python 路径（如果不在正确目录下运行）
-export PYTHONPATH="${PYTHONPATH}:/Volumes/葱葱的硬盘/我的项目/lerobot/lerobot/src"
-cd /Volumes/葱葱的硬盘/我的项目/lerobot/lerobot
-```
+# 设置 Python 路径
+export PYTHONPATH="$(pwd)/src:$PYTHONPATH"
 
-### 推理演示（快速跑通流程）
-
-```bash
 python leborot_infer_demo/demo_inference.py
 ```
 
@@ -133,31 +135,4 @@ leborot_infer_demo/
     benchmark.html       # 优化效果可视化页面
     benchmark_data.json  # Benchmark 统计结果（自动生成）
     multi_run_data.json  # 多轮耗时波动数据（自动生成）
-```
-
-## 常见问题
-
-### 提示 `Module not found: lerobot`
-
-需要设置 Python 路径：
-
-```bash
-export PYTHONPATH="/Volumes/葱葱的硬盘/我的项目/lerobot/lerobot/src:$PYTHONPATH"
-```
-
-### 模型下载慢
-
-首次运行会自动从 HuggingFace 下载模型权重（约 1GB）。可以设置镜像：
-
-```bash
-export HF_ENDPOINT=https://hf-mirror.com
-```
-
-### M1 Mac 内存不足
-
-如果内存占用过高，减小 batch_size 或图像分辨率：
-
-```python
-# 在 demo_inference.py 中修改
-images = {"observation.images.camera1": torch.randn(1, 3, 160, 160)}  # 缩小图片
 ```

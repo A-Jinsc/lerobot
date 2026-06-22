@@ -8,7 +8,10 @@ SmolVLA CPU Benchmark
   python demo_benchmark.py
 """
 
+import copy
+from collections import deque
 import json
+import os
 import statistics
 import time
 import torch
@@ -16,35 +19,58 @@ import torch.nn.functional as F
 
 from lerobot.policies.smolvla import SmolVLAPolicy
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching
-from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching, make_att_2d_masks
+from lerobot.policies.smolvla.smolvlm_with_expert import build_rope_cache
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 torch.set_num_threads(4)
+# Force reload modules to pick up code changes
+import sys
+import importlib
+for _mod in [
+    "lerobot.policies.smolvla.smolvlm_with_expert",
+    "lerobot.policies.smolvla.modeling_smolvla",
+    "lerobot.policies.smolvla",
+]:
+    if _mod in sys.modules:
+        importlib.reload(sys.modules[_mod])
 DEVICE = torch.device("cpu")
 NUM_WARMUP = 1
 NUM_RUNS = 5
 
 
-# ---- 原版 attention（来自 smolvlm_with_expert.py）----
+# ---- 兼容 3D mask 的 eager attention（4D 广播版）----
 
-def baseline_eager_attention(num_attention_heads, num_key_value_heads, head_dim, attn_mask, q, k, v):
+def compat_eager_attention(num_attention_heads, num_key_value_heads, head_dim, attn_mask, q, k, v):
+    """
+    Handles 3D mask (B, Q, KV) by expanding to 4D (B, 1, Q, KV) before masking.
+    Compatible with both square (prefix prefix) and rectangular (suffix prefix+suffix) masks.
+    """
     num_kv_groups = num_attention_heads // num_key_value_heads
     b, seq_k = k.shape[:2]
+    _, seq_q = q.shape[:2]
 
+    # Expand K/V to num_attention_heads: (B, seq, num_kv, num_groups, head_dim) -> (B, seq, num_heads, head_dim)
     k = k[:, :, :, None, :].expand(b, seq_k, num_key_value_heads, num_kv_groups, head_dim)
-    k = k.reshape(b, seq_k, num_key_value_heads * num_kv_groups, head_dim)
+    k = k.reshape(b, seq_k, num_attention_heads, head_dim)
     v = v[:, :, :, None, :].expand(b, seq_k, num_key_value_heads, num_kv_groups, head_dim)
-    v = v.reshape(b, seq_k, num_key_value_heads * num_kv_groups, head_dim)
+    v = v.reshape(b, seq_k, num_attention_heads, head_dim)
 
     q, k, v = q.to(torch.float32), k.to(torch.float32), v.to(torch.float32)
-    q, k = q.transpose(1, 2), k.transpose(1, 2)
+    q, k = q.transpose(1, 2), k.transpose(1, 2)  # (B, H, Q, D) and (B, H, KV, D)
     att = torch.matmul(q, k.transpose(2, 3)) * (head_dim ** -0.5)
     att = att.to(torch.float32)
     big_neg = torch.finfo(att.dtype).min
-    att = torch.where(attn_mask[:, None, :, :], att, big_neg)
+
+    # Expand 3D mask (B, Q, KV) -> (B, 1, Q, KV) to broadcast over num_heads
+    mask_4d = attn_mask.unsqueeze(1)
+    # Also handle rectangular: if KV dim doesn't match, slice to correct size
+    if mask_4d.shape[3] != seq_k:
+        mask_4d = mask_4d[:, :, :, :seq_k]
+    att = torch.where(mask_4d.bool(), att, big_neg)
     probs = F.softmax(att, dim=-1).to(v.dtype)
-    out = torch.matmul(probs, v.permute(0, 2, 1, 3))
-    out = out.permute(0, 2, 1, 3).reshape(b, -1, num_attention_heads * head_dim)
+    out = torch.matmul(probs, v.transpose(1, 2))
+    out = out.transpose(1, 2).reshape(b, seq_q, num_attention_heads * head_dim)
     return out
 
 
@@ -54,9 +80,22 @@ def optimized_sdpa(num_attention_heads, num_key_value_heads, head_dim, attn_mask
     num_kv_groups = num_attention_heads // num_key_value_heads
     b, seq_k = k.shape[:2]
 
-    k = k.view(b, seq_k, num_key_value_heads, num_kv_groups, head_dim).transpose(1, 2)
-    v = v.view(b, seq_k, num_key_value_heads, num_kv_groups, head_dim).transpose(1, 2)
+    k = k[:, :, :, None, :].expand(
+        b, seq_k, num_key_value_heads, num_kv_groups, head_dim
+    )
+    k = k.reshape(b, seq_k, num_key_value_heads * num_kv_groups, head_dim)
+
+    v = v[:, :, :, None, :].expand(
+        b, seq_k, num_key_value_heads, num_kv_groups, head_dim
+    )
+    v = v.reshape(b, seq_k, num_key_value_heads * num_kv_groups, head_dim)
+
+    k = k.to(dtype=q.dtype)
+    v = v.to(dtype=q.dtype)
+
     q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
 
     out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
     out = out.transpose(1, 2).contiguous().view(b, -1, num_attention_heads * head_dim)
@@ -66,63 +105,179 @@ def optimized_sdpa(num_attention_heads, num_key_value_heads, head_dim, attn_mask
 # ---- 基线 VLA 模型（保留原 attention 实现）----
 
 class BaselineModel(VLAFlowMatching):
-    def __init__(self, config, rtc_processor=None):
-        super().__init__(config, rtc_processor)
+    def __init__(self, config, rtc_processor=None, processor=None):
+        super().__init__(config, rtc_processor, processor=processor)
         self._patch_attention_interface()
 
     def _patch_attention_interface(self):
         cfg = self.vlm_with_expert
         cfg.get_attention_interface = lambda: (
-            lambda q, k, v, mask, bs, hd:
-            baseline_eager_attention(cfg.num_attention_heads, cfg.num_key_value_heads,
-                                     cfg.vlm.config.text_config.head_dim, mask, q, k, v)
+            lambda mask, bs, hd, q, k, v:
+            compat_eager_attention(cfg.num_attention_heads, cfg.num_key_value_heads,
+                                  cfg.vlm.config.text_config.head_dim, mask, q, k, v)
         )
 
 
-# ---- 优化版 VLA 模型（StaticCache + SDPA）----
+# ---- 优化版 VLA 模型（StaticCache + RoPE Cache + 消除 torch.cat）----
 
 class OptimizedModel(VLAFlowMatching):
-    def __init__(self, config, rtc_processor=None):
-        super().__init__(config, rtc_processor)
+    def __init__(self, config, rtc_processor=None, processor=None):
+        super().__init__(config, rtc_processor, processor=processor)
         self._init_static_cache(config)
         self._patch_attention_interface()
 
-    def _init_static_cache(self, config):
-        self._max_prefix_len = config.prefix_length if config.prefix_length > 0 else 1024
-        self._num_layers = self.vlm_with_expert.num_vlm_layers
-        self._num_kv_heads = self.vlm_with_expert.num_key_value_heads
-        self._head_dim = self.vlm_with_expert.vlm.config.text_config.head_dim
-        device = next(self.parameters()).device
-        b = 1
-        self._static_k = torch.zeros(b, self._num_layers, self._num_kv_heads,
-                                     self._max_prefix_len, self._head_dim,
-                                     dtype=torch.bfloat16, device=device)
-        self._static_v = torch.zeros(b, self._num_layers, self._num_kv_heads,
-                                     self._max_prefix_len, self._head_dim,
-                                     dtype=torch.bfloat16, device=device)
-        self._static_k_offset = 0
-
     def _patch_attention_interface(self):
         cfg = self.vlm_with_expert
         cfg.get_attention_interface = lambda: (
-            lambda q, k, v, mask, bs, hd:
-            optimized_sdpa(cfg.num_attention_heads, cfg.num_key_value_heads,
-                            cfg.vlm.config.text_config.head_dim, mask, q, k, v)
+            lambda mask, bs, hd, q, k, v:
+            compat_eager_attention(cfg.num_attention_heads, cfg.num_key_value_heads,
+                                  cfg.vlm.config.text_config.head_dim, mask, q, k, v)
         )
+
+    def _init_static_cache(self, config):
+        # Allocate enough space for prefix + full chunk (covers all suffix tokens written during denoising)
+        chunk_size = config.chunk_size if config.chunk_size > 0 else 50
+        self._max_prefix_len = (config.prefix_length if config.prefix_length > 0 else 1024) + chunk_size
+        self._num_layers = self.vlm_with_expert.num_vlm_layers
+        self._num_kv_heads = self.vlm_with_expert.num_key_value_heads
+        head_dim = self.vlm_with_expert.vlm.config.text_config.head_dim
+        device = next(self.parameters()).device
+        b = 1
+        print(f"[OptimizedModel] _init_static_cache: max_prefix={self._max_prefix_len}, layers={self._num_layers}, kv_heads={self._num_kv_heads}, head_dim={head_dim}")
+        self._static_k = torch.zeros(
+            b, self._num_layers, self._num_kv_heads,
+            self._max_prefix_len, head_dim,
+            dtype=torch.bfloat16, device=device
+        )
+        self._static_v = torch.zeros(
+            b, self._num_layers, self._num_kv_heads,
+            self._max_prefix_len, head_dim,
+            dtype=torch.bfloat16, device=device
+        )
+        self._static_k_offset = 0
+
+        # Pre-build RoPE cache at maximum prefix length
+        self._rope_cache = build_rope_cache(
+            self._max_prefix_len, head_dim, device
+        )
+
+    def _reset_static_cache(self):
+        self._static_k_offset = 0
+        self._static_k.zero_()
+        self._static_v.zero_()
+
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs):
+        """Optimized sample_actions: build masks once, reuse across denoise steps."""
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute image and language key value cache with RoPE cache
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+            rope_cache=self._rope_cache,
+            static_k=self._static_k,
+            static_v=self._static_v,
+            static_offset=0,
+            use_static_cache=True,
+        )
+
+        # Infer actual prefix length from past_key_values
+        first_layer = past_key_values.get(0, {})
+        kv_len = first_layer.get("kv_len", 0)
+        self._static_k_offset = kv_len
+
+        num_steps = self.config.num_steps
+        dt = -1.0 / num_steps
+
+        # Build suffix mask ONCE before the loop
+        suffix_len = self.config.chunk_size
+        bs = bsize
+        pl = prefix_pad_masks.shape[1]
+        prefix_pad_2d = prefix_pad_masks[:, None, :].expand(bs, suffix_len, pl)
+        suffix_pad = torch.ones(bs, suffix_len, device=device, dtype=torch.bool)
+        suffix_att = torch.ones(bs, suffix_len, device=device, dtype=torch.bool)
+        suffix_att_2d_template = make_att_2d_masks(suffix_pad, suffix_att)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids_base = (prefix_offsets - 1).expand(bs, 1)  # last prefix position
+
+        x_t = noise
+        for step in range(num_steps):
+            time_val = 1.0 + step * dt
+            time_tensor = torch.tensor(time_val, dtype=torch.float32, device=device).expand(bsize)
+
+            suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time_tensor)
+            actual_suffix_len = suffix_pad_masks.shape[1]
+            full_att_2d = torch.cat([prefix_pad_2d[:, :, :pl], suffix_att_2d_template[:, :actual_suffix_len, :]], dim=2)
+            suffix_pos = position_ids_base + torch.cumsum(suffix_pad_masks, dim=1)
+            position_ids = torch.cat([prefix_position_ids, suffix_pos], dim=1)
+
+            outputs_embeds, _ = self.vlm_with_expert.forward(
+                attention_mask=full_att_2d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=self.config.use_cache,
+                fill_kv_cache=False,
+                rope_cache=self._rope_cache,
+                static_k=self._static_k,
+                static_v=self._static_v,
+                static_offset=self._static_k_offset,
+                use_static_cache=True,
+            )
+            suffix_out = outputs_embeds[1][:, -self.config.chunk_size:]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            v_t = self.action_out_proj(suffix_out)
+            x_t = x_t + dt * v_t
+
+        return x_t
+
+    def reset(self):
+        self._reset_static_cache()
 
 
 # ---- SmolVLAPolicy 变体 ----
 
 class BaselinePolicy(SmolVLAPolicy):
-    def __init__(self, config, **kwargs):
-        super().__init__(config, **kwargs)
-        self.model = BaselineModel(config, rtc_processor=self.rtc_processor)
+    def __init__(self, config, processor=None, rtc_processor=None, **kwargs):
+        # 用 load_vlm_weights=False 避免联网下载 VLM 权重
+        cfg = copy.deepcopy(config)
+        cfg.load_vlm_weights = False
+        model = BaselineModel(cfg, rtc_processor=rtc_processor, processor=processor)
+        super().__init__(config, processor=processor, rtc_processor=rtc_processor, _model=model, **kwargs)
+        self.reset()
+
+    def reset(self):
+        self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
+        if hasattr(self.model, "_reset_static_cache"):
+            self.model._reset_static_cache()
 
 
 class OptimizedPolicy(SmolVLAPolicy):
-    def __init__(self, config, **kwargs):
-        super().__init__(config, **kwargs)
-        self.model = OptimizedModel(config, rtc_processor=self.rtc_processor)
+    def __init__(self, config, processor=None, rtc_processor=None, **kwargs):
+        cfg = copy.deepcopy(config)
+        cfg.load_vlm_weights = False
+        model = OptimizedModel(cfg, rtc_processor=rtc_processor, processor=processor)
+        super().__init__(config, processor=processor, rtc_processor=rtc_processor, _model=model, **kwargs)
+
+    def reset(self):
+        self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
+        if hasattr(self.model, "_reset_static_cache"):
+            self.model._reset_static_cache()
 
 
 # ---- 辅助函数 ----
@@ -180,6 +335,12 @@ def infer_with_timing(policy, batch):
 
     t0 = time.perf_counter()
 
+    # Check if static cache is available (optimized policy)
+    use_static = hasattr(policy.model, "_static_k") and policy.model._static_k is not None
+    rope_cache = getattr(policy.model, "_rope_cache", None)
+    if use_static:
+        policy.model._reset_static_cache()
+
     # Prefix Embed
     t1 = time.perf_counter()
     with torch.no_grad():
@@ -203,7 +364,15 @@ def infer_with_timing(policy, batch):
             inputs_embeds=[prefix_embs, None],
             use_cache=policy.config.use_cache,
             fill_kv_cache=True,
+            rope_cache=rope_cache,
+            static_k=policy.model._static_k if use_static else None,
+            static_v=policy.model._static_v if use_static else None,
+            static_offset=0,
+            use_static_cache=use_static,
         )
+    static_offset = 0
+    if use_static and past_key_values:
+        static_offset = past_key_values.get(0, {}).get("kv_len", 0)
     timings["kv_build"] = time.perf_counter() - t2
 
     # Denoise Loop
@@ -214,6 +383,12 @@ def infer_with_timing(policy, batch):
                          dtype=torch.float32, device=device)
     num_steps = policy.config.num_steps
     dt = -1.0 / num_steps
+
+    pl = prefix_pad_masks.shape[1]
+    prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+    # The global position id of the last suffix token (increases by 1 each step)
+    last_suffix_pos = (prefix_offsets - 1 + policy.config.chunk_size).long()
+
     x_t = noise
 
     t3 = time.perf_counter()
@@ -223,28 +398,49 @@ def infer_with_timing(policy, batch):
 
         with torch.no_grad():
             suffix_embs, suffix_pad_masks, suffix_att_masks = policy.model.embed_suffix(x_t, time_tensor)
-            suffix_len = suffix_pad_masks.shape[1]
-            bs = prefix_pad_masks.shape[0]
-            pl = prefix_pad_masks.shape[1]
-            prefix_pad_2d = prefix_pad_masks[:, None, :].expand(bs, suffix_len, pl)
-            suffix_att_2d = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-            full_att_2d = torch.cat([prefix_pad_2d, suffix_att_2d], dim=2)
-            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+            # Only forward the LAST token (Q=1) — required for use_cache=True to match KV len
+            last_suffix_emb = suffix_embs[:, -1:]   # (B, 1, D)
+            last_suffix_pad = suffix_pad_masks[:, -1:]  # (B, 1)
+            last_suffix_att = suffix_att_masks[:, -1:]  # (B, 1)
 
-            outputs_embeds, _ = policy.model.vlm_with_expert.forward(
-                attention_mask=full_att_2d,
+            # Build mask for the single last token attending to full prefix+suffix
+            # Row shape: (B, 1, prefix+suffix) — all ones (attends to everything valid)
+            prefix_mask_row = torch.ones(bsize, 1, pl, device=device, dtype=torch.bool)
+            # Cumulative prefix LM mask within suffix part (always last token → all valid)
+            cumsum = torch.cumsum(suffix_att_masks, dim=1)  # (B, suffix_len)
+            last_cumsum = cumsum[:, -1:]  # (B, 1)
+            valid_suffix_mask = cumsum[:, None, :] <= last_cumsum[:, :, None]  # (B, 1, suffix_len)
+            last_valid_mask = valid_suffix_mask[:, :, -1:]  # (B, 1, 1) — last token's valid positions
+            pad_2d = suffix_pad_masks[:, None, :] * suffix_pad_masks[:, :, None]  # (B, S, S)
+            suffix_mask_row = (last_valid_mask & pad_2d[:, -1:, :])  # (B, 1, suffix_len)
+            full_att_row = torch.cat([prefix_mask_row, suffix_mask_row], dim=2)  # (B, 1, prefix+suffix)
+
+            position_ids = torch.cat([prefix_position_ids.long(), last_suffix_pos], dim=1)
+
+            outputs_embeds, past_key_values_out = policy.model.vlm_with_expert.forward(
+                attention_mask=full_att_row,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                inputs_embeds=[None, suffix_embs],
+                inputs_embeds=[None, last_suffix_emb],
                 use_cache=policy.config.use_cache,
                 fill_kv_cache=False,
+                rope_cache=rope_cache,
+                static_k=policy.model._static_k if use_static else None,
+                static_v=policy.model._static_v if use_static else None,
+                static_offset=static_offset,
+                use_static_cache=use_static,
             )
-            suffix_out = outputs_embeds[1][:, -policy.config.chunk_size:]
-            suffix_out = suffix_out.to(dtype=torch.float32)
-            v_t = policy.model.action_out_proj(suffix_out)
+            # Update offset: +1 for the single new suffix token written to static cache
+            if use_static and past_key_values_out:
+                static_offset = past_key_values_out.get(0, {}).get("kv_len", static_offset)
+            v_t = outputs_embeds[1].to(dtype=torch.float32)  # (B, 1, D)
+            v_t = policy.model.action_out_proj(v_t)  # (B, 1, action_dim)
 
-        x_t = x_t + dt * v_t
+        # Expand v_t back to full chunk_size for the Euler update
+        v_t_full = v_t.squeeze(1).unsqueeze(1).expand(bsize, policy.config.chunk_size, -1)
+        x_t = x_t + dt * v_t_full
+        # Advance position counter for next step
+        last_suffix_pos = last_suffix_pos + 1
 
     timings["denoise_steps"] = time.perf_counter() - t3
     timings["total"] = timings["prefix_embed"] + timings["kv_build"] + timings["denoise_steps"]
@@ -273,18 +469,19 @@ def main():
     batch = make_mock_batch(base_policy)
 
     # 创建两个版本（权重共享）
-    baseline = BaselinePolicy(base_policy.config)
+    base_processor = base_policy.model.vlm_with_expert.processor
+    baseline = BaselinePolicy(base_policy.config, processor=base_processor)
     baseline.load_state_dict(base_policy.state_dict(), strict=False)
     baseline.to(DEVICE)
     baseline.eval()
 
-    optimized = OptimizedPolicy(base_policy.config)
+    optimized = OptimizedPolicy(base_policy.config, processor=base_processor)
     optimized.load_state_dict(base_policy.state_dict(), strict=False)
     optimized.to(DEVICE)
     optimized.eval()
 
     # 重置优化版的 StaticCache
-    optimized.model._static_k_offset = 0
+    optimized.model._reset_static_cache()
 
     print(f"\nWarming up ({NUM_WARMUP} run)...")
     infer_with_timing(baseline, batch)
@@ -298,7 +495,7 @@ def main():
     for i in range(NUM_RUNS):
         print(f"  Run {i+1}/{NUM_RUNS}...", end=" ", flush=True)
         baseline_runs.append(infer_with_timing(baseline, batch))
-        optimized.model._static_k_offset = 0
+        optimized.model._reset_static_cache()
         optimized_runs.append(infer_with_timing(optimized, batch))
         print("done")
 
@@ -361,10 +558,12 @@ def main():
         sp = results["optimized"][k]["speedup_percent"]
         print(f"{label:<20} {b:>14.4f} {o:>14.4f} {sp:>9.1f}%")
 
-    # 保存 JSON
-    output_path = "static/benchmark_data.json"
-    import os
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    # 保存 JSON（写到 leborot_infer_demo/static/，与 benchmark.html 同目录）
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    static_dir = os.path.join(script_dir, "static")
+    os.makedirs(static_dir, exist_ok=True)
+
+    output_path = os.path.join(static_dir, "benchmark_data.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
@@ -383,12 +582,12 @@ def main():
             "denoise_steps": [r["denoise_steps"] for r in optimized_runs],
         },
     }
-    multi_path = "static/multi_run_data.json"
+    multi_path = os.path.join(static_dir, "multi_run_data.json")
     with open(multi_path, "w", encoding="utf-8") as f:
         json.dump(multi_run_data, f, indent=2)
 
     print(f"Multi-run data saved to: {multi_path}")
-    print("\nDone. Open static/benchmark.html to view results.")
+    print("\nDone. Open leborot_infer_demo/static/benchmark.html to view results.")
 
 
 if __name__ == "__main__":
