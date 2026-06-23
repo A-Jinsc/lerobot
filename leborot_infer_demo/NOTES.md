@@ -59,15 +59,15 @@ python leborot_infer_demo/demo_benchmark.py
 
 ![优化效果](/Volumes/%E8%91%B1%E8%91%B1%E7%9A%84%E7%A1%AC%E7%9B%98/%E6%88%91%E7%9A%84%E9%A1%B9%E7%9B%AE/lerobot/lerobot/leborot_infer_demo/pic/%E4%BC%98%E5%8C%96%E6%95%88%E6%9E%9C.png)
 
-## 优化点说明
+### 优化点说明
 
-### 优化 1：SDPA 替代手写 Eager Attention
+#### 优化 1：SDPA 替代手写 Eager Attention
 
 **基线**：手写 `matmul + softmax`，显式 `expand + reshape`，大量中间 tensor。
 
 **优化**：使用 `torch.nn.functional.scaled_dot_product_attention`（SDPA），PyTorch 自动选择最优后端（Mac 上走 MPS/Accelerate），减少中间 tensor 创建和内存拷贝。
 
-```121:147:demo_inference.py
+```python
 def optimized_sdpa_attention_forward(...):
     # expand + reshape 到 [b, heads, seq, head_dim]
     key_states = key_states.to(dtype=query_states.dtype)
@@ -82,21 +82,28 @@ def optimized_sdpa_attention_forward(...):
     )
 ```
 
-### 优化 2：StaticCache 预分配 KV 缓存
+#### 优化 2：StaticCache 预分配 KV 缓存
 
 **基线**：每次 denoise step 通过 `torch.cat([past_kv, new_kv], dim=1)` 动态拼接，O(n) 拷贝开销。
 
 **优化**：预先分配固定大小的 KV tensor，每次 denoise 直接写入指定位置，避免 `torch.cat`。
 
-```230:240:demo_inference.py
-    def _static_cache_write(self, layer_idx, key_states, value_states):
-        end = self._static_k_offset + seq_len
-        # 直接写入预分配位置，O(1) 写入
-        self._static_k[0, layer_idx, :, self._static_k_offset:end] = key_states[...]
-        self._static_v[0, layer_idx, :, self._static_k_offset:end] = value_states[...]
+```python
+def _static_cache_write(self, layer_idx, key_states, value_states):
+   end = self._static_k_offset + seq_len
+   # 直接写入预分配位置，O(1) 写入
+   self._static_k[0, layer_idx, :, self._static_k_offset:end] = key_states[...]
+   self._static_v[0, layer_idx, :, self._static_k_offset:end] = value_states[...]
 ```
 
-### 优化 3：分块 Cross-Attention
+#### 优化 3：分块 Cross-Attention
 
 将 expert 的 cross-attention 查询分块处理（如每块 16 个 action token），减少 denoise step 中的峰值内存占用。
 
+
+
+## 三、仓库提交
+
+相关内容已提交至`Github`仓库（https://github.com/A-Jinsc/lerobot）
+
+![提交记录](/Volumes/%E8%91%B1%E8%91%B1%E7%9A%84%E7%A1%AC%E7%9B%98/%E6%88%91%E7%9A%84%E9%A1%B9%E7%9B%AE/lerobot/lerobot/leborot_infer_demo/pic/%E6%8F%90%E4%BA%A4%E8%AE%B0%E5%BD%95.png)
